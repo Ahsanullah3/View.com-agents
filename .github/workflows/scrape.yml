@@ -1,27 +1,39 @@
-name: Scrape Agent Profiles to Sheets
+name: Scrape Agent Profiles
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # Run daily at 2 AM UTC, adjust as needed
-  workflow_dispatch:        # Allow manual triggering
+    - cron: '0 2 * * *' # Runs daily at 2 AM UTC
+  workflow_dispatch:
+    inputs:
+      start_row:
+        description: 'Row number to start from (default 2)'
+        required: false
+        default: '2'
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write # Needed to trigger the next run
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Install dependencies
         run: |
-          pip install gspread curl_cffi
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: Run scraper
+        timeout-minutes: 300
         env:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          START_ROW: ${{ github.event.inputs.start_row || '2' }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python scrape.py
