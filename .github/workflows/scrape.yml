@@ -2,7 +2,7 @@ name: Scrape Agent Profiles
 
 on:
   schedule:
-    - cron: '0 2 * * *' # Runs daily at 2 AM UTC
+    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       start_row:
@@ -14,7 +14,7 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     permissions:
-      actions: write # Needed to trigger the next run
+      actions: write
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +33,7 @@ jobs:
         env:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           START_ROW: ${{ github.event.inputs.start_row || '2' }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: python scrape.py
