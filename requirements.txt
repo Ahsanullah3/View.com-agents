@@ -1,0 +1,4 @@
+gspread>=6,<7
+curl_cffi>=0.7
+stealthkit[solver]>=1.1.1
+playwright>=1.40
