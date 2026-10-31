@@ -9,7 +9,6 @@ import gspread
 import requests
 from curl_cffi.requests import AsyncSession
 
-# Configuration
 MAX_URLS_PER_RUN = 90
 CONCURRENCY = 3
 BATCH_PAUSE = 8
@@ -66,14 +65,12 @@ async def scrape_one(session: AsyncSession, url: str, sem: asyncio.Semaphore):
     async with sem:
         await asyncio.sleep(random.uniform(1.5, 4.0))
         try:
-            # Fast path
             resp = await session.get(url, impersonate="chrome124", timeout=30)
             if resp.status_code == 200 and not is_datadome_block(resp):
                 parsed = parse_next_data(resp.text)
                 if parsed:
                     return {"url": url, **parsed}
-            
-            # Fallback to StealthKit
+
             from stealthkit import StealthSession
             sr = StealthSession(impersonate="chrome124")
             sr.solve_challenge(url)
@@ -92,7 +89,7 @@ async def scrape_batch(session: AsyncSession, urls: list[str]):
     return await asyncio.gather(*tasks)
 
 def trigger_next_run(start_row: int):
-    token = os.environ["GH_PAT"]
+    token = os.environ["GITHUB_TOKEN"]
     repo = os.environ["GITHUB_REPOSITORY"]
     workflow_file = "scrape.yml"
     url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/dispatches"
@@ -110,8 +107,7 @@ def main():
 
     start_row = int(os.environ.get("START_ROW", "2"))
     col_a = ws.col_values(1)
-    
-    # Find all URLs from start_row onwards
+
     all_rows = [(idx, u.strip()) for idx, u in enumerate(col_a, start=1)
                 if idx >= start_row and u and u.strip()]
 
@@ -123,7 +119,6 @@ def main():
     remaining = len(all_rows) - len(batch)
     print(f"Start row: {start_row}. Processing {len(batch)} URLs. {remaining} remaining after this run.")
 
-    # Write headers
     ws.update("B1:P1", [HEADERS])
 
     async def run():
@@ -142,7 +137,6 @@ def main():
 
     asyncio.run(run())
 
-    # Trigger next batch if needed
     if remaining > 0:
         next_start_row = batch[-1][0] + 1
         print(f"Triggering next run from row {next_start_row}")
