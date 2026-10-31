@@ -12,15 +12,22 @@ from curl_cffi.requests import AsyncSession
 MAX_URLS_PER_RUN = 90
 CONCURRENCY = 3
 BATCH_PAUSE = 8
+
+# Write-back starts at column H (8th column). 15 fields -> H to V
+START_COL_LETTER = "H"
+START_COL_INDEX = 8
 HEADERS = [
     "agent_id", "first_name", "last_name", "position", "email",
     "mobile", "phone", "average_sold_price", "sold_listings",
     "agency_id", "agency_name", "agency_address", "agency_phone",
     "agency_website", "error"
 ]
+END_COL_LETTER = gspread.utils.rowcol_to_a1(1, START_COL_INDEX + len(HEADERS) - 1).rstrip("1")  # "V"
+
 
 def get_gspread_client():
     return gspread.service_account_from_dict(json.loads(os.environ["GOOGLE_SA_JSON"]))
+
 
 def parse_next_data(html: str):
     match = re.search(
@@ -52,6 +59,7 @@ def parse_next_data(html: str):
         "agency_website": agency.get("website"),
     }
 
+
 def is_datadome_block(resp) -> bool:
     headers = {k.lower(): v for k, v in resp.headers.items()}
     if headers.get("x-datadome", "").lower() == "protected":
@@ -60,6 +68,7 @@ def is_datadome_block(resp) -> bool:
         return True
     body = resp.text or ""
     return "js.datadome.co/tags.js" in body or "captcha-delivery.com" in body
+
 
 async def scrape_one(session: AsyncSession, url: str, sem: asyncio.Semaphore):
     async with sem:
@@ -83,10 +92,12 @@ async def scrape_one(session: AsyncSession, url: str, sem: asyncio.Semaphore):
         except Exception as e:
             return {"url": url, "error": str(e)}
 
+
 async def scrape_batch(session: AsyncSession, urls: list[str]):
     sem = asyncio.Semaphore(CONCURRENCY)
     tasks = [scrape_one(session, u, sem) for u in urls]
     return await asyncio.gather(*tasks)
+
 
 def trigger_next_run(start_row: int):
     token = os.environ["GITHUB_TOKEN"]
@@ -99,6 +110,7 @@ def trigger_next_run(start_row: int):
     print(f"Triggered next run from row {start_row}: HTTP {r.status_code}")
     if r.status_code != 204:
         print(f"Trigger failed: {r.text}")
+
 
 def main():
     gc = get_gspread_client()
@@ -119,7 +131,8 @@ def main():
     remaining = len(all_rows) - len(batch)
     print(f"Start row: {start_row}. Processing {len(batch)} URLs. {remaining} remaining after this run.")
 
-    ws.update("B1:P1", [HEADERS])
+    # Headers written to H1:V1
+    ws.update(f"{START_COL_LETTER}1:{END_COL_LETTER}1", [HEADERS])
 
     async def run():
         async with AsyncSession() as session:
@@ -130,7 +143,10 @@ def main():
                 updates = []
                 for (orig_row, _), r in zip(sub, results):
                     values = [r.get(h, "") for h in HEADERS]
-                    updates.append({"range": f"B{orig_row}:P{orig_row}", "values": [values]})
+                    updates.append({
+                        "range": f"{START_COL_LETTER}{orig_row}:{END_COL_LETTER}{orig_row}",
+                        "values": [values]
+                    })
                 ws.batch_update(updates, value_input_option="RAW")
                 if i + 30 < len(batch):
                     time.sleep(BATCH_PAUSE)
@@ -143,6 +159,7 @@ def main():
         trigger_next_run(next_start_row)
     else:
         print("All URLs processed. No further trigger needed.")
+
 
 if __name__ == "__main__":
     main()
