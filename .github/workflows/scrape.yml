@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -29,11 +30,24 @@ jobs:
           playwright install-deps chromium
 
       - name: Run scraper
+        id: scrape
         timeout-minutes: 300
         env:
           GOOGLE_SA_JSON: ${{ secrets.GOOGLE_SA_JSON }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           START_ROW: ${{ github.event.inputs.start_row || '2' }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: python scrape.py
+
+      # Only dispatch the next batch if:
+      #   - the scrape step succeeded (not cancelled, not failed)
+      #   - the scraper reported there are more rows to process
+      - name: Trigger next batch
+        if: success() && steps.scrape.outputs.next_start_row != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Dispatching next run from row ${{ steps.scrape.outputs.next_start_row }}"
+          gh workflow run scrape.yml \
+            --repo "${{ github.repository }}" \
+            --ref main \
+            --field start_row="${{ steps.scrape.outputs.next_start_row }}"
