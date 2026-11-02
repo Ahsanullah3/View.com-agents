@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+import signal
 import time
 
 import gspread
@@ -32,6 +33,24 @@ HEADERS = [
     "agency_website", "error"
 ]
 END_COL_LETTER = gspread.utils.rowcol_to_a1(1, START_COL_INDEX + len(HEADERS) - 1).rstrip("1")  # "V"
+
+
+# ---------------------------------------------------------------------------
+# Cancellation handling
+# ---------------------------------------------------------------------------
+_cancelled = False
+
+
+def _handle_cancel(signum, frame):
+    """Mark the run as cancelled and raise so we unwind the async loop."""
+    global _cancelled
+    _cancelled = True
+    logger.warning(f"Received signal {signum}. Cancelling run...")
+    raise SystemExit(143)
+
+
+signal.signal(signal.SIGTERM, _handle_cancel)
+signal.signal(signal.SIGINT, _handle_cancel)
 
 
 def get_gspread_client():
@@ -85,7 +104,7 @@ async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio
         await asyncio.sleep(random.uniform(0.5, 1.5))
         try:
             resp = await session.get(url, impersonate="chrome124", timeout=30)
-            
+
             # Immediately skip and log if the link is broken (404, 410, etc.)
             if resp.status_code in [404, 410]:
                 logger.warning(f"Row {row_idx}: BROKEN LINK ({resp.status_code}) -> Skipping immediately.")
@@ -107,6 +126,9 @@ async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio
 
             logger.error(f"Row {row_idx}: FAILED | Blocked or failed with status {resp.status_code}.")
             return {"url": url, "error": f"blocked_status_{resp.status_code}"}
+        except asyncio.CancelledError:
+            # Let cancellation propagate cleanly
+            raise
         except Exception as e:
             logger.error(f"Row {row_idx}: ERROR | Exception occurred: {str(e)}")
             return {"url": url, "error": str(e)}
@@ -116,19 +138,6 @@ async def scrape_batch(session: AsyncSession, sub_batch: list[tuple[int, str]]):
     sem = asyncio.Semaphore(CONCURRENCY)
     tasks = [scrape_one(session, orig_row, u, sem) for orig_row, u in sub_batch]
     return await asyncio.gather(*tasks)
-
-
-def trigger_next_run(start_row: int):
-    token = os.environ["GITHUB_TOKEN"]
-    repo = os.environ["GITHUB_REPOSITORY"]
-    workflow_file = "scrape.yml"
-    url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/dispatches"
-    payload = {"ref": "main", "inputs": {"start_row": str(start_row)}}
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
-    r = requests.post(url, json=payload, headers=headers, timeout=30)
-    logger.info(f"Triggered next run from row {start_row}: HTTP {r.status_code}")
-    if r.status_code != 204:
-        logger.error(f"Trigger failed: {r.text}")
 
 
 def main():
@@ -145,6 +154,11 @@ def main():
 
     if not all_rows:
         logger.info(f"No URLs found from row {start_row}. All done.")
+        # Signal to workflow that there's nothing left to do
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:
+            with open(gh_out, "a") as f:
+                f.write("next_start_row=\n")
         return
 
     batch = all_rows[:MAX_URLS_PER_RUN]
@@ -154,13 +168,27 @@ def main():
     # Fixed gspread update keyword syntax to avoid DeprecationWarning
     ws.update(values=[HEADERS], range_name=f"{START_COL_LETTER}1:{END_COL_LETTER}1")
 
+    # Track the highest row we actually wrote back to Sheets.
+    # Only advance on a successful batch_update.
+    last_done_row = start_row - 1
+
     async def run():
+        nonlocal last_done_row
         async with AsyncSession() as session:
             for i in range(0, len(batch), CONCURRENCY):
+                if _cancelled:
+                    logger.warning("Cancellation detected before chunk. Stopping.")
+                    return
+
                 sub = batch[i:i + CONCURRENCY]
                 logger.info(f"--- Processing concurrent chunk: rows {sub[0][0]} to {sub[-1][0]} ({len(sub)} links) ---")
-                
+
                 results = await scrape_batch(session, sub)
+
+                if _cancelled:
+                    logger.warning("Cancellation detected after fetch. Skipping write for this chunk.")
+                    return
+
                 updates = []
                 for (orig_row, _), r in zip(sub, results):
                     values = [r.get(h, "") for h in HEADERS]
@@ -168,22 +196,59 @@ def main():
                         "range": f"{START_COL_LETTER}{orig_row}:{END_COL_LETTER}{orig_row}",
                         "values": [values]
                     })
-                
+
                 ws.batch_update(updates, value_input_option="RAW")
+                last_done_row = sub[-1][0]
                 logger.info(f"Successfully wrote chunk (rows {sub[0][0]} to {sub[-1][0]}) to Google Sheets.")
 
                 if i + CONCURRENCY < len(batch):
                     logger.info(f"Pausing for {BATCH_PAUSE} seconds before next chunk...")
-                    time.sleep(BATCH_PAUSE)
+                    await asyncio.sleep(BATCH_PAUSE)
 
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except (SystemExit, asyncio.CancelledError, KeyboardInterrupt):
+        logger.warning(
+            f"Run cancelled. Last successfully written row: {last_done_row}. "
+            f"NOT triggering next batch."
+        )
+        # Leave next_start_row empty so the workflow does not dispatch.
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:
+            with open(gh_out, "a") as f:
+                f.write("next_start_row=\n")
+        raise SystemExit(143)
 
-    if remaining > 0:
-        next_start_row = batch[-1][0] + 1
-        logger.info(f"Batch complete. Triggering next GitHub workflow run starting at row {next_start_row}...")
-        trigger_next_run(next_start_row)
+    # Only compute next start row based on what we ACTUALLY processed.
+    if remaining > 0 and not _cancelled and last_done_row >= start_row:
+        next_start_row = last_done_row + 1
+        logger.info(f"Batch complete. Requesting next workflow run starting at row {next_start_row}...")
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:
+            with open(gh_out, "a") as f:
+                f.write(f"next_start_row={next_start_row}\n")
+        else:
+            # Local run fallback: dispatch directly
+            trigger_next_run(next_start_row)
     else:
         logger.info("All URLs in the spreadsheet have been successfully processed. No further trigger needed.")
+        gh_out = os.environ.get("GITHUB_OUTPUT")
+        if gh_out:
+            with open(gh_out, "a") as f:
+                f.write("next_start_row=\n")
+
+
+def trigger_next_run(start_row: int):
+    token = os.environ["GITHUB_TOKEN"]
+    repo = os.environ["GITHUB_REPOSITORY"]
+    workflow_file = "scrape.yml"
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_file}/dispatches"
+    payload = {"ref": "main", "inputs": {"start_row": str(start_row)}}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    r = requests.post(url, json=payload, headers=headers, timeout=30)
+    logger.info(f"Triggered next run from row {start_row}: HTTP {r.status_code}")
+    if r.status_code != 204:
+        logger.error(f"Trigger failed: {r.text}")
 
 
 if __name__ == "__main__":
