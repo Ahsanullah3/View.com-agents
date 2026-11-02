@@ -19,8 +19,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 MAX_URLS_PER_RUN = 200
-CONCURRENCY = 20
-BATCH_PAUSE = 2
+CONCURRENCY = 30
+BATCH_PAUSE = 3
 
 # Write-back starts at column H (8th column). 15 fields -> H to V
 START_COL_LETTER = "H"
@@ -38,50 +38,35 @@ def get_gspread_client():
     return gspread.service_account_from_dict(json.loads(os.environ["GOOGLE_SA_JSON"]))
 
 
-def parse_next_data(html: str, row_idx: int):
-    # Pattern 1: Standard Next.js script tag ID
+def parse_next_data(html: str):
     match = re.search(
         r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
         html, re.DOTALL
     )
     if not match:
-        # Pattern 2: Alternative window assignment pattern
-        match = re.search(
-            r'__NEXT_DATA__\s*=\s*(\{.*?\});?\s*(?:<\/script>|window)',
-            html, re.DOTALL
-        )
-    
-    if not match:
-        snippet = html[:300].replace('\n', ' ')
-        logger.warning(f"Row {row_idx}: Could not locate __NEXT_DATA__. HTML snippet: {snippet}")
         return None
-
-    try:
-        data = json.loads(match.group(1))
-        props = data.get("props", {}).get("pageProps", {})
-        agent = props.get("agentProfile", {})
-        agency = agent.get("agencyDetail", {})
-        if not agent:
-            return None
-        return {
-            "agent_id": agent.get("id"),
-            "first_name": agent.get("firstName"),
-            "last_name": agent.get("lastName"),
-            "position": agent.get("position"),
-            "email": agent.get("email"),
-            "mobile": agent.get("mobile"),
-            "phone": agent.get("phone"),
-            "average_sold_price": agent.get("averageSoldPrice"),
-            "sold_listings": agent.get("numberOfSoldListings"),
-            "agency_id": agency.get("id"),
-            "agency_name": agency.get("name"),
-            "agency_address": agency.get("address"),
-            "agency_phone": agency.get("phone"),
-            "agency_website": agency.get("website"),
-        }
-    except Exception as e:
-        logger.error(f"Row {row_idx}: JSON decode error on __NEXT_DATA__: {str(e)}")
+    data = json.loads(match.group(1))
+    props = data.get("props", {}).get("pageProps", {})
+    agent = props.get("agentProfile", {})
+    agency = agent.get("agencyDetail", {})
+    if not agent:
         return None
+    return {
+        "agent_id": agent.get("id"),
+        "first_name": agent.get("firstName"),
+        "last_name": agent.get("lastName"),
+        "position": agent.get("position"),
+        "email": agent.get("email"),
+        "mobile": agent.get("mobile"),
+        "phone": agent.get("phone"),
+        "average_sold_price": agent.get("averageSoldPrice"),
+        "sold_listings": agent.get("numberOfSoldListings"),
+        "agency_id": agency.get("id"),
+        "agency_name": agency.get("name"),
+        "agency_address": agency.get("address"),
+        "agency_phone": agency.get("phone"),
+        "agency_website": agency.get("website"),
+    }
 
 
 def is_datadome_block(resp) -> bool:
@@ -94,41 +79,56 @@ def is_datadome_block(resp) -> bool:
     return "js.datadome.co/tags.js" in body or "captcha-delivery.com" in body
 
 
+def sync_stealth_fallback(url: str):
+    """Synchronous StealthSession wrapper to be offloaded into a thread pool."""
+    from stealthkit import StealthSession
+    sr = StealthSession(impersonate="chrome124")
+    sr.solve_challenge(url)
+    resp2 = sr.get(url)
+    if resp2 and resp2.status_code == 200:
+        return parse_next_data(resp2.text)
+    return None
+
+
 async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio.Semaphore):
     async with sem:
-        logger.info(f"Row {row_idx}: Starting scrape -> {url}")
-        await asyncio.sleep(random.uniform(0.2, 0.8))
-        
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://view.com.au/",
-        }
-
+        logger.info(f"Row {row_idx}: Starting scrape for URL -> {url}")
+        await asyncio.sleep(random.uniform(0.5, 1.5))
         try:
-            # Using curl_cffi chrome impersonation (Stealth Mode)
-            resp = await session.get(url, headers=headers, impersonate="chrome124", timeout=30)
+            resp = await session.get(url, impersonate="chrome124", timeout=30)
             
-            if resp.status_code != 200:
-                logger.warning(f"Row {row_idx}: HTTP {resp.status_code} -> Skipping.")
-                return {"url": url, "error": f"http_status_{resp.status_code}"}
+            # Immediately skip and log if the link is broken (404, 410, etc.)
+            if resp.status_code in [404, 410]:
+                logger.warning(f"Row {row_idx}: BROKEN LINK ({resp.status_code}) -> Skipping immediately.")
+                return {"url": url, "error": f"broken_link_{resp.status_code}"}
 
-            if is_datadome_block(resp):
-                logger.warning(f"Row {row_idx}: DataDome Blocked -> Skipping.")
-                return {"url": url, "error": "datadome_blocked"}
+            if resp.status_code == 200 and not is_datadome_block(resp):
+                parsed = parse_next_data(resp.text)
+                if parsed:
+                    logger.info(
+                        f"Row {row_idx}: SUCCESS | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
+                        f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
+                    )
+                    return {"url": url, **parsed}
 
-            parsed = parse_next_data(resp.text, row_idx)
+            # Skip fallback for non-recoverable HTTP client/server errors
+            if resp.status_code in [400, 401, 405, 415, 500, 502, 503, 504]:
+                logger.warning(f"Row {row_idx}: HTTP ERROR {resp.status_code} -> Skipping.")
+                return {"url": url, "error": f"http_error_{resp.status_code}"}
+
+            logger.warning(f"Row {row_idx}: Standard request blocked/failed. Attempting StealthSession fallback in thread...")
+            parsed = await asyncio.to_thread(sync_stealth_fallback, url)
             if parsed:
                 logger.info(
-                    f"Row {row_idx}: SUCCESS | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
+                    f"Row {row_idx}: SUCCESS (via fallback) | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
                     f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
                 )
                 return {"url": url, **parsed}
             
-            return {"url": url, "error": "invalid_payload"}
-
+            logger.error(f"Row {row_idx}: FAILED | Blocked after fallback.")
+            return {"url": url, "error": "blocked_after_fallback"}
         except Exception as e:
-            logger.error(f"Row {row_idx}: ERROR | {str(e)}")
+            logger.error(f"Row {row_idx}: ERROR | Exception occurred: {str(e)}")
             return {"url": url, "error": str(e)}
 
 
@@ -171,6 +171,7 @@ def main():
     remaining = len(all_rows) - len(batch)
     logger.info(f"Start row: {start_row}. Processing batch of {len(batch)} URLs. {remaining} remaining after this run.")
 
+    # Fixed gspread update keyword syntax to avoid DeprecationWarning
     ws.update(values=[HEADERS], range_name=f"{START_COL_LETTER}1:{END_COL_LETTER}1")
 
     async def run():
