@@ -85,6 +85,12 @@ async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio
         await asyncio.sleep(random.uniform(0.5, 1.5))
         try:
             resp = await session.get(url, impersonate="chrome124", timeout=30)
+            
+            # Immediately skip and log if the link is broken (404, 410, etc.)
+            if resp.status_code in [404, 410]:
+                logger.warning(f"Row {row_idx}: BROKEN LINK ({resp.status_code}) -> Skipping immediately.")
+                return {"url": url, "error": f"broken_link_{resp.status_code}"}
+
             if resp.status_code == 200 and not is_datadome_block(resp):
                 parsed = parse_next_data(resp.text)
                 if parsed:
@@ -93,6 +99,11 @@ async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio
                         f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
                     )
                     return {"url": url, **parsed}
+
+            # Skip fallback for other client errors (excluding 403 which could be a DataDome challenge)
+            if resp.status_code in [400, 401, 405, 415, 500, 502, 503, 504]:
+                logger.warning(f"Row {row_idx}: HTTP ERROR {resp.status_code} -> Skipping.")
+                return {"url": url, "error": f"http_error_{resp.status_code}"}
 
             logger.warning(f"Row {row_idx}: Standard request blocked/failed. Attempting StealthSession fallback...")
             from stealthkit import StealthSession
