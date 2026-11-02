@@ -18,9 +18,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MAX_URLS_PER_RUN = 90
-CONCURRENCY = 10
-BATCH_PAUSE = 3
+MAX_URLS_PER_RUN = 270
+CONCURRENCY = 20
+BATCH_PAUSE = 1
 
 # Write-back starts at column H (8th column). 15 fields -> H to V
 START_COL_LETTER = "H"
