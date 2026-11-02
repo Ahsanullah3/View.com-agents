@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configured to process 200 total per run with 20 parallel workers per chunk
-MAX_URLS_PER_RUN = 1000
+MAX_URLS_PER_RUN = 200
 CONCURRENCY = 20
 BATCH_PAUSE = 2
 
