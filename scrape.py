@@ -18,7 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configured to process 200 total per run with 20 parallel workers per chunk
 MAX_URLS_PER_RUN = 200
 CONCURRENCY = 20
 BATCH_PAUSE = 2
@@ -39,35 +38,50 @@ def get_gspread_client():
     return gspread.service_account_from_dict(json.loads(os.environ["GOOGLE_SA_JSON"]))
 
 
-def parse_next_data(html: str):
+def parse_next_data(html: str, row_idx: int):
+    # Pattern 1: Standard Next.js script tag ID
     match = re.search(
         r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
         html, re.DOTALL
     )
     if not match:
+        # Pattern 2: Alternative window assignment pattern
+        match = re.search(
+            r'__NEXT_DATA__\s*=\s*(\{.*?\});?\s*(?:<\/script>|window)',
+            html, re.DOTALL
+        )
+    
+    if not match:
+        snippet = html[:300].replace('\n', ' ')
+        logger.warning(f"Row {row_idx}: Could not locate __NEXT_DATA__. HTML snippet: {snippet}")
         return None
-    data = json.loads(match.group(1))
-    props = data.get("props", {}).get("pageProps", {})
-    agent = props.get("agentProfile", {})
-    agency = agent.get("agencyDetail", {})
-    if not agent:
+
+    try:
+        data = json.loads(match.group(1))
+        props = data.get("props", {}).get("pageProps", {})
+        agent = props.get("agentProfile", {})
+        agency = agent.get("agencyDetail", {})
+        if not agent:
+            return None
+        return {
+            "agent_id": agent.get("id"),
+            "first_name": agent.get("firstName"),
+            "last_name": agent.get("lastName"),
+            "position": agent.get("position"),
+            "email": agent.get("email"),
+            "mobile": agent.get("mobile"),
+            "phone": agent.get("phone"),
+            "average_sold_price": agent.get("averageSoldPrice"),
+            "sold_listings": agent.get("numberOfSoldListings"),
+            "agency_id": agency.get("id"),
+            "agency_name": agency.get("name"),
+            "agency_address": agency.get("address"),
+            "agency_phone": agency.get("phone"),
+            "agency_website": agency.get("website"),
+        }
+    except Exception as e:
+        logger.error(f"Row {row_idx}: JSON decode error on __NEXT_DATA__: {str(e)}")
         return None
-    return {
-        "agent_id": agent.get("id"),
-        "first_name": agent.get("firstName"),
-        "last_name": agent.get("lastName"),
-        "position": agent.get("position"),
-        "email": agent.get("email"),
-        "mobile": agent.get("mobile"),
-        "phone": agent.get("phone"),
-        "average_sold_price": agent.get("averageSoldPrice"),
-        "sold_listings": agent.get("numberOfSoldListings"),
-        "agency_id": agency.get("id"),
-        "agency_name": agency.get("name"),
-        "agency_address": agency.get("address"),
-        "agency_phone": agency.get("phone"),
-        "agency_website": agency.get("website"),
-    }
 
 
 def is_datadome_block(resp) -> bool:
@@ -84,20 +98,26 @@ async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio
     async with sem:
         logger.info(f"Row {row_idx}: Starting scrape -> {url}")
         await asyncio.sleep(random.uniform(0.2, 0.8))
+        
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://view.com.au/",
+        }
+
         try:
-            resp = await session.get(url, impersonate="chrome124", timeout=30)
+            # Using curl_cffi chrome impersonation (Stealth Mode)
+            resp = await session.get(url, headers=headers, impersonate="chrome124", timeout=30)
             
-            # Immediately skip and log any status codes other than 200 OK
             if resp.status_code != 200:
-                logger.warning(f"Row {row_idx}: HTTP {resp.status_code} -> Invalid/broken link. Skipping immediately.")
+                logger.warning(f"Row {row_idx}: HTTP {resp.status_code} -> Skipping.")
                 return {"url": url, "error": f"http_status_{resp.status_code}"}
 
-            # Check for DataDome block
             if is_datadome_block(resp):
-                logger.warning(f"Row {row_idx}: DataDome Blocked -> Skipping immediately without fallback.")
+                logger.warning(f"Row {row_idx}: DataDome Blocked -> Skipping.")
                 return {"url": url, "error": "datadome_blocked"}
 
-            parsed = parse_next_data(resp.text)
+            parsed = parse_next_data(resp.text, row_idx)
             if parsed:
                 logger.info(
                     f"Row {row_idx}: SUCCESS | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
@@ -105,7 +125,6 @@ async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio
                 )
                 return {"url": url, **parsed}
             
-            logger.warning(f"Row {row_idx}: Failed to parse Next.js data payload.")
             return {"url": url, "error": "invalid_payload"}
 
         except Exception as e:
@@ -152,7 +171,6 @@ def main():
     remaining = len(all_rows) - len(batch)
     logger.info(f"Start row: {start_row}. Processing batch of {len(batch)} URLs. {remaining} remaining after this run.")
 
-    # Fixed gspread update keyword syntax
     ws.update(values=[HEADERS], range_name=f"{START_COL_LETTER}1:{END_COL_LETTER}1")
 
     async def run():
