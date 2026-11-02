@@ -79,6 +79,17 @@ def is_datadome_block(resp) -> bool:
     return "js.datadome.co/tags.js" in body or "captcha-delivery.com" in body
 
 
+def sync_stealth_fallback(url: str):
+    """Synchronous StealthSession wrapper to be offloaded into a thread pool."""
+    from stealthkit import StealthSession
+    sr = StealthSession(impersonate="chrome124")
+    sr.solve_challenge(url)
+    resp2 = sr.get(url)
+    if resp2 and resp2.status_code == 200:
+        return parse_next_data(resp2.text)
+    return None
+
+
 async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio.Semaphore):
     async with sem:
         logger.info(f"Row {row_idx}: Starting scrape for URL -> {url}")
@@ -100,24 +111,19 @@ async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio
                     )
                     return {"url": url, **parsed}
 
-            # Skip fallback for other client errors (excluding 403 which could be a DataDome challenge)
+            # Skip fallback for non-recoverable HTTP client/server errors
             if resp.status_code in [400, 401, 405, 415, 500, 502, 503, 504]:
                 logger.warning(f"Row {row_idx}: HTTP ERROR {resp.status_code} -> Skipping.")
                 return {"url": url, "error": f"http_error_{resp.status_code}"}
 
-            logger.warning(f"Row {row_idx}: Standard request blocked/failed. Attempting StealthSession fallback...")
-            from stealthkit import StealthSession
-            sr = StealthSession(impersonate="chrome124")
-            sr.solve_challenge(url)
-            resp2 = sr.get(url)
-            if resp2 and resp2.status_code == 200:
-                parsed = parse_next_data(resp2.text)
-                if parsed:
-                    logger.info(
-                        f"Row {row_idx}: SUCCESS (via fallback) | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
-                        f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
-                    )
-                    return {"url": url, **parsed}
+            logger.warning(f"Row {row_idx}: Standard request blocked/failed. Attempting StealthSession fallback in thread...")
+            parsed = await asyncio.to_thread(sync_stealth_fallback, url)
+            if parsed:
+                logger.info(
+                    f"Row {row_idx}: SUCCESS (via fallback) | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
+                    f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
+                )
+                return {"url": url, **parsed}
             
             logger.error(f"Row {row_idx}: FAILED | Blocked after fallback.")
             return {"url": url, "error": "blocked_after_fallback"}
@@ -165,8 +171,8 @@ def main():
     remaining = len(all_rows) - len(batch)
     logger.info(f"Start row: {start_row}. Processing batch of {len(batch)} URLs. {remaining} remaining after this run.")
 
-    # Ensure headers are written
-    ws.update(f"{START_COL_LETTER}1:{END_COL_LETTER}1", [HEADERS])
+    # Fixed gspread update keyword syntax to avoid DeprecationWarning
+    ws.update(values=[HEADERS], range_name=f"{START_COL_LETTER}1:{END_COL_LETTER}1")
 
     async def run():
         async with AsyncSession() as session:
