@@ -18,9 +18,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MAX_URLS_PER_RUN = 90
-CONCURRENCY = 10
-BATCH_PAUSE = 3
+# Configured to process 200 total per run with 20 parallel workers per chunk
+MAX_URLS_PER_RUN = 1000
+CONCURRENCY = 20
+BATCH_PAUSE = 2
 
 # Write-back starts at column H (8th column). 15 fields -> H to V
 START_COL_LETTER = "H"
@@ -79,56 +80,36 @@ def is_datadome_block(resp) -> bool:
     return "js.datadome.co/tags.js" in body or "captcha-delivery.com" in body
 
 
-def sync_stealth_fallback(url: str):
-    """Synchronous StealthSession wrapper to be offloaded into a thread pool."""
-    from stealthkit import StealthSession
-    sr = StealthSession(impersonate="chrome124")
-    sr.solve_challenge(url)
-    resp2 = sr.get(url)
-    if resp2 and resp2.status_code == 200:
-        return parse_next_data(resp2.text)
-    return None
-
-
 async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio.Semaphore):
     async with sem:
-        logger.info(f"Row {row_idx}: Starting scrape for URL -> {url}")
-        await asyncio.sleep(random.uniform(0.5, 1.5))
+        logger.info(f"Row {row_idx}: Starting scrape -> {url}")
+        await asyncio.sleep(random.uniform(0.2, 0.8))
         try:
             resp = await session.get(url, impersonate="chrome124", timeout=30)
             
-            # Immediately skip and log if the link is broken (404, 410, etc.)
-            if resp.status_code in [404, 410]:
-                logger.warning(f"Row {row_idx}: BROKEN LINK ({resp.status_code}) -> Skipping immediately.")
-                return {"url": url, "error": f"broken_link_{resp.status_code}"}
+            # Immediately skip and log any status codes other than 200 OK
+            if resp.status_code != 200:
+                logger.warning(f"Row {row_idx}: HTTP {resp.status_code} -> Invalid/broken link. Skipping immediately.")
+                return {"url": url, "error": f"http_status_{resp.status_code}"}
 
-            if resp.status_code == 200 and not is_datadome_block(resp):
-                parsed = parse_next_data(resp.text)
-                if parsed:
-                    logger.info(
-                        f"Row {row_idx}: SUCCESS | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
-                        f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
-                    )
-                    return {"url": url, **parsed}
+            # Check for DataDome block
+            if is_datadome_block(resp):
+                logger.warning(f"Row {row_idx}: DataDome Blocked -> Skipping immediately without fallback.")
+                return {"url": url, "error": "datadome_blocked"}
 
-            # Skip fallback for non-recoverable HTTP client/server errors
-            if resp.status_code in [400, 401, 405, 415, 500, 502, 503, 504]:
-                logger.warning(f"Row {row_idx}: HTTP ERROR {resp.status_code} -> Skipping.")
-                return {"url": url, "error": f"http_error_{resp.status_code}"}
-
-            logger.warning(f"Row {row_idx}: Standard request blocked/failed. Attempting StealthSession fallback in thread...")
-            parsed = await asyncio.to_thread(sync_stealth_fallback, url)
+            parsed = parse_next_data(resp.text)
             if parsed:
                 logger.info(
-                    f"Row {row_idx}: SUCCESS (via fallback) | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
+                    f"Row {row_idx}: SUCCESS | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
                     f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
                 )
                 return {"url": url, **parsed}
             
-            logger.error(f"Row {row_idx}: FAILED | Blocked after fallback.")
-            return {"url": url, "error": "blocked_after_fallback"}
+            logger.warning(f"Row {row_idx}: Failed to parse Next.js data payload.")
+            return {"url": url, "error": "invalid_payload"}
+
         except Exception as e:
-            logger.error(f"Row {row_idx}: ERROR | Exception occurred: {str(e)}")
+            logger.error(f"Row {row_idx}: ERROR | {str(e)}")
             return {"url": url, "error": str(e)}
 
 
@@ -171,7 +152,7 @@ def main():
     remaining = len(all_rows) - len(batch)
     logger.info(f"Start row: {start_row}. Processing batch of {len(batch)} URLs. {remaining} remaining after this run.")
 
-    # Fixed gspread update keyword syntax to avoid DeprecationWarning
+    # Fixed gspread update keyword syntax
     ws.update(values=[HEADERS], range_name=f"{START_COL_LETTER}1:{END_COL_LETTER}1")
 
     async def run():
