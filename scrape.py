@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import random
 import re
@@ -9,9 +10,17 @@ import gspread
 import requests
 from curl_cffi.requests import AsyncSession
 
+# Configure logging to print timestamp, level, and message clearly
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
 MAX_URLS_PER_RUN = 90
-CONCURRENCY = 3
-BATCH_PAUSE = 8
+CONCURRENCY = 10
+BATCH_PAUSE = 3
 
 # Write-back starts at column H (8th column). 15 fields -> H to V
 START_COL_LETTER = "H"
@@ -70,16 +79,22 @@ def is_datadome_block(resp) -> bool:
     return "js.datadome.co/tags.js" in body or "captcha-delivery.com" in body
 
 
-async def scrape_one(session: AsyncSession, url: str, sem: asyncio.Semaphore):
+async def scrape_one(session: AsyncSession, row_idx: int, url: str, sem: asyncio.Semaphore):
     async with sem:
-        await asyncio.sleep(random.uniform(1.5, 4.0))
+        logger.info(f"Row {row_idx}: Starting scrape for URL -> {url}")
+        await asyncio.sleep(random.uniform(0.5, 1.5))
         try:
             resp = await session.get(url, impersonate="chrome124", timeout=30)
             if resp.status_code == 200 and not is_datadome_block(resp):
                 parsed = parse_next_data(resp.text)
                 if parsed:
+                    logger.info(
+                        f"Row {row_idx}: SUCCESS | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
+                        f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
+                    )
                     return {"url": url, **parsed}
 
+            logger.warning(f"Row {row_idx}: Standard request blocked/failed. Attempting StealthSession fallback...")
             from stealthkit import StealthSession
             sr = StealthSession(impersonate="chrome124")
             sr.solve_challenge(url)
@@ -87,15 +102,22 @@ async def scrape_one(session: AsyncSession, url: str, sem: asyncio.Semaphore):
             if resp2 and resp2.status_code == 200:
                 parsed = parse_next_data(resp2.text)
                 if parsed:
+                    logger.info(
+                        f"Row {row_idx}: SUCCESS (via fallback) | Agent: {parsed.get('first_name')} {parsed.get('last_name')} | "
+                        f"Agency: {parsed.get('agency_name')} | Sold Listings: {parsed.get('sold_listings')}"
+                    )
                     return {"url": url, **parsed}
+            
+            logger.error(f"Row {row_idx}: FAILED | Blocked after fallback.")
             return {"url": url, "error": "blocked_after_fallback"}
         except Exception as e:
+            logger.error(f"Row {row_idx}: ERROR | Exception occurred: {str(e)}")
             return {"url": url, "error": str(e)}
 
 
-async def scrape_batch(session: AsyncSession, urls: list[str]):
+async def scrape_batch(session: AsyncSession, sub_batch: list[tuple[int, str]]):
     sem = asyncio.Semaphore(CONCURRENCY)
-    tasks = [scrape_one(session, u, sem) for u in urls]
+    tasks = [scrape_one(session, orig_row, u, sem) for orig_row, u in sub_batch]
     return await asyncio.gather(*tasks)
 
 
@@ -107,12 +129,13 @@ def trigger_next_run(start_row: int):
     payload = {"ref": "main", "inputs": {"start_row": str(start_row)}}
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     r = requests.post(url, json=payload, headers=headers, timeout=30)
-    print(f"Triggered next run from row {start_row}: HTTP {r.status_code}")
+    logger.info(f"Triggered next run from row {start_row}: HTTP {r.status_code}")
     if r.status_code != 204:
-        print(f"Trigger failed: {r.text}")
+        logger.error(f"Trigger failed: {r.text}")
 
 
 def main():
+    logger.info("Initializing Google Sheets client...")
     gc = get_gspread_client()
     sh = gc.open_by_key(os.environ["SHEET_ID"])
     ws = sh.worksheet("Sheet1")
@@ -124,22 +147,23 @@ def main():
                 if idx >= start_row and u and u.strip()]
 
     if not all_rows:
-        print(f"No URLs found from row {start_row}. All done.")
+        logger.info(f"No URLs found from row {start_row}. All done.")
         return
 
     batch = all_rows[:MAX_URLS_PER_RUN]
     remaining = len(all_rows) - len(batch)
-    print(f"Start row: {start_row}. Processing {len(batch)} URLs. {remaining} remaining after this run.")
+    logger.info(f"Start row: {start_row}. Processing batch of {len(batch)} URLs. {remaining} remaining after this run.")
 
-    # Headers written to H1:V1
+    # Ensure headers are written
     ws.update(f"{START_COL_LETTER}1:{END_COL_LETTER}1", [HEADERS])
 
     async def run():
         async with AsyncSession() as session:
-            for i in range(0, len(batch), 30):
-                sub = batch[i:i + 30]
-                urls = [u for _, u in sub]
-                results = await scrape_batch(session, urls)
+            for i in range(0, len(batch), CONCURRENCY):
+                sub = batch[i:i + CONCURRENCY]
+                logger.info(f"--- Processing concurrent chunk: rows {sub[0][0]} to {sub[-1][0]} ({len(sub)} links) ---")
+                
+                results = await scrape_batch(session, sub)
                 updates = []
                 for (orig_row, _), r in zip(sub, results):
                     values = [r.get(h, "") for h in HEADERS]
@@ -147,18 +171,22 @@ def main():
                         "range": f"{START_COL_LETTER}{orig_row}:{END_COL_LETTER}{orig_row}",
                         "values": [values]
                     })
+                
                 ws.batch_update(updates, value_input_option="RAW")
-                if i + 30 < len(batch):
+                logger.info(f"Successfully wrote chunk (rows {sub[0][0]} to {sub[-1][0]}) to Google Sheets.")
+
+                if i + CONCURRENCY < len(batch):
+                    logger.info(f"Pausing for {BATCH_PAUSE} seconds before next chunk...")
                     time.sleep(BATCH_PAUSE)
 
     asyncio.run(run())
 
     if remaining > 0:
         next_start_row = batch[-1][0] + 1
-        print(f"Triggering next run from row {next_start_row}")
+        logger.info(f"Batch complete. Triggering next GitHub workflow run starting at row {next_start_row}...")
         trigger_next_run(next_start_row)
     else:
-        print("All URLs processed. No further trigger needed.")
+        logger.info("All URLs in the spreadsheet have been successfully processed. No further trigger needed.")
 
 
 if __name__ == "__main__":
